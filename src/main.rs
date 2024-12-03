@@ -2,10 +2,10 @@ use anyhow::{anyhow, Context};
 use chrono::prelude::*;
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::Command;
-use reqwest::StatusCode;
 
 #[derive(Deserialize, Debug)]
 struct Config {
@@ -20,12 +20,19 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[command(author = "Tim Fennis <fennis.tim@gmail.com>")]
 enum Commands {
+    /// Initialize a new script for this day
     Init { day: Option<u32> },
+    /// Run tests for this day (not implemented)
     Test { day: Option<u32> },
+    /// Run this day's solution
     Run { day: Option<u32> },
+    /// Get the input for the given day's puzzle
     Get { day: Option<u32> },
+    /// Preview the puzzle input for the given day
     Preview { day: Option<u32> },
+    /// Print out the entire input for the given day
     Print { day: Option<u32> },
 }
 
@@ -231,11 +238,26 @@ fn preview_puzzle(puzzle: &Puzzle) -> anyhow::Result<()> {
     let len = usize::try_from((line_count + 1).ilog10() + 2)
         .context("failed to calc line number width")?;
 
-    let truncate = line_count > 45;
+    let truncate = line_count > 50;
+
+    let max_w = term_size::dimensions().map(|(w, _)| w).unwrap_or(10_000);
+    let mut line_length_list = Vec::new();
 
     for (nr, line) in file.lines().enumerate() {
+        line_length_list.push(line.len() as i32);
+        let line = if line.len() > max_w {
+            Cow::Owned(
+                line.chars()
+                    .take(max_w - len - 5)
+                    .chain("..".chars())
+                    .collect::<String>(),
+            )
+        } else {
+            Cow::Borrowed(line)
+        };
+
         let nr = nr + 1;
-        if truncate && (nr <= 20 || nr >= (line_count - 20)) {
+        if nr <= 20 || nr >= (line_count - 20) || !truncate {
             println!("{:>width$} | {line}", nr, width = len)
         } else if nr == 22 {
             let truncated = line_count - 40;
@@ -249,6 +271,23 @@ fn preview_puzzle(puzzle: &Puzzle) -> anyhow::Result<()> {
         }
     }
 
+    line_length_list.sort();
+
+    if line_length_list.len() > 0 {
+        let median = if line_length_list.len() % 2 == 0 {
+            let idx = line_length_list.len().div_euclid(2);
+            f64::from(line_length_list[idx] + line_length_list[idx + 1]) / 2.0
+        } else {
+            let idx = line_length_list.len().div_ceil(2);
+            f64::from(line_length_list[idx])
+        };
+
+        println!("\nMax line length: {}", line_length_list.last().unwrap());
+        println!("Median line length: {median}");
+        println!("Min line length: {}", line_length_list.first().unwrap());
+    } else {
+        println!("\nInput is empty");
+    }
     Ok(())
 }
 
@@ -260,37 +299,27 @@ fn get_puzzle(puzzle: &Puzzle, cookie_value: &str) -> anyhow::Result<()> {
     let output_file = puzzle.input_path();
 
     if std::fs::exists(&output_file).context("failed to check if file exists")? {
-        return Ok(());
+        std::fs::create_dir_all(format!("input/{year}/"))
+            .context("cannot create puzzle directory")?;
+
+        let response = ureq::get(&format!("https://adventofcode.com/{year}/day/{day}/input"))
+            .set("Cookie", cookie_value)
+            .set("User-Agent", "aoc-cli/0.0.1 fennis.tim@gmail.com")
+            .call()
+            .context("cannot create request")?;
+
+        let status = response.status();
+
+        if (200u16..300u16).contains(&status) {
+            let text = response
+                .into_string()
+                .context("cannot parse response as text")?;
+
+            std::fs::write(&output_file, text).context("cannot write puzzle output")?;
+        } else {
+            return Err(anyhow!("ERR: didn't receive 200 status from server"));
+        }
     }
 
-    std::fs::create_dir_all(format!("input/{year}/")).context("cannot create puzzle directory")?;
-
-    let client = reqwest::blocking::Client::new();
-
-    let req = client
-        .request(
-            reqwest::Method::GET,
-            format!("https://adventofcode.com/{year}/day/{day}/input"),
-        )
-        .header("Cookie", cookie_value)
-        .build()
-        .context("cannot create request")?;
-
-    let res = client
-        .execute(req)
-        .context("failed to request puzzle input")?;
-
-    let status = res.status();
-
-    if status == StatusCode::OK {
-
-        let text = res.text().context("cannot parse response as text")?;
-
-        std::fs::write(&output_file, text).context("cannot write puzzle output")?;
-        preview_puzzle(puzzle)?;
-    } else {
-        return Err(anyhow!("ERR: didn't receive 200 status from server"));
-    }
-
-    Ok(())
+    preview_puzzle(puzzle)
 }
