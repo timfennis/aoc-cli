@@ -298,7 +298,7 @@ fn get_puzzle(puzzle: &Puzzle, cookie_value: &str) -> anyhow::Result<()> {
 
     let output_file = puzzle.input_path();
 
-    if std::fs::exists(&output_file).context("failed to check if file exists")? {
+    if !std::fs::exists(&output_file).context("failed to check if file exists")? {
         std::fs::create_dir_all(format!("input/{year}/"))
             .context("cannot create puzzle directory")?;
 
