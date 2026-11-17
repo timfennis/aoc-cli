@@ -1,21 +1,34 @@
-use anyhow::{anyhow, Context};
-use chrono::prelude::*;
+use anyhow::{Context, anyhow, bail};
+use chrono::{DateTime, Datelike, FixedOffset, Local, TimeZone, Utc};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
 use std::borrow::Cow;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
-use std::process::Command;
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-#[derive(Deserialize, Debug)]
-struct Config {
-    cookie: String,
-    year: Option<i32>,
+const USER_AGENT: &str = concat!(
+    "aoc-cli/",
+    env!("CARGO_PKG_VERSION"),
+    " fennis.tim@gmail.com"
+);
+
+/// Template written by `aoc init`
+const SOLUTION_TEMPLATE: &str =
+    "let input = read_stdin();\n\nfor line in input.lines() {\n\tprint(line);\n}\n";
+
+/// Advent of Code puzzles unlock at midnight US Eastern time (UTC-5, there is no DST in December)
+fn aoc_timezone() -> FixedOffset {
+    FixedOffset::west_opt(5 * 3600).expect("UTC-5 is a valid offset")
 }
 
 #[derive(Parser)]
+#[command(about = "Advent of Code helper for ndc solutions")]
 struct Cli {
-    #[clap(subcommand)]
+    /// Puzzle year. Defaults to the year directory you're in, then $YEAR, then the current December
+    #[arg(short, long, global = true)]
+    year: Option<i32>,
+
+    #[command(subcommand)]
     command: Option<Commands>,
 }
 
@@ -26,7 +39,7 @@ enum Commands {
     Init { day: Option<u32> },
     /// Run tests for this day (not implemented)
     Test { day: Option<u32> },
-    /// Run this day's solution
+    /// Run this day's solution with the puzzle input on stdin
     Run { day: Option<u32> },
     /// Get the input for the given day's puzzle
     Get { day: Option<u32> },
@@ -37,17 +50,84 @@ enum Commands {
 }
 
 impl Commands {
-    pub fn day(&self) -> Option<u32> {
+    fn day(&self) -> Option<u32> {
         match self {
-            Commands::Init { day } => *day,
-            Commands::Test { day } => *day,
-            Commands::Run { day } => *day,
-            Commands::Get { day } => *day,
-            Commands::Preview { day } => *day,
-            Commands::Print { day } => *day,
+            Commands::Init { day }
+            | Commands::Test { day }
+            | Commands::Run { day }
+            | Commands::Get { day }
+            | Commands::Preview { day }
+            | Commands::Print { day } => *day,
         }
     }
 }
+
+/// The monorepo holding solutions in `<root>/<year>/<day>.ndc` and inputs in `<root>/input/<year>/<day>.txt`
+struct Workspace {
+    root: PathBuf,
+}
+
+impl Workspace {
+    /// The root is `$AOC_ROOT` if set, otherwise the directory holding the `.env` file, otherwise the working directory
+    fn discover(env_file: Option<PathBuf>) -> anyhow::Result<Self> {
+        let root = match (std::env::var_os("AOC_ROOT"), env_file) {
+            (Some(root), _) => PathBuf::from(root),
+            (None, Some(env_file)) => env_file
+                .parent()
+                .context(".env file has no parent directory")?
+                .to_path_buf(),
+            (None, None) => {
+                std::env::current_dir().context("cannot determine working directory")?
+            }
+        };
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("AoC root {} does not exist", root.display()))?;
+
+        Ok(Self { root })
+    }
+
+    /// The year of the `<root>/<year>/` directory we're currently in, if any
+    fn year_from_cwd(&self) -> Option<i32> {
+        let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+        let first = cwd.strip_prefix(&self.root).ok()?.components().next()?;
+        first
+            .as_os_str()
+            .to_str()?
+            .parse()
+            .ok()
+            .filter(|year| *year >= FIRST_YEAR)
+    }
+
+    fn solution_path(&self, puzzle: &Puzzle) -> PathBuf {
+        self.root
+            .join(puzzle.year.to_string())
+            .join(format!("{}.ndc", puzzle.day))
+    }
+
+    fn input_path(&self, puzzle: &Puzzle) -> PathBuf {
+        self.root
+            .join("input")
+            .join(puzzle.year.to_string())
+            .join(format!("{}.txt", puzzle.day))
+    }
+
+    fn read_input(&self, puzzle: &Puzzle) -> anyhow::Result<String> {
+        let path = self.input_path(puzzle);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(text),
+            Err(err) if err.kind() == ErrorKind::NotFound => bail!(
+                "input not downloaded ({}), run `aoc get {} -y {}`",
+                path.display(),
+                puzzle.day,
+                puzzle.year
+            ),
+            Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+        }
+    }
+}
+
+const FIRST_YEAR: i32 = 2015;
 
 #[derive(Debug, Clone)]
 struct Puzzle {
@@ -56,270 +136,310 @@ struct Puzzle {
 }
 
 impl Puzzle {
-    pub fn input_path(&self) -> String {
-        format!("input/{}/{}.txt", self.year, self.day)
-    }
-}
-
-#[derive(Debug, Clone)]
-enum Action {
-    Init(Puzzle),
-    Test(Puzzle),
-    Run(Puzzle),
-    Get(Puzzle),
-    Preview(Puzzle),
-    Print(Puzzle),
-}
-
-impl Action {
-    fn execute(&self, config: &Config) -> anyhow::Result<()> {
-        match self {
-            Action::Init(puzzle) => init_puzzle(puzzle),
-            Action::Run(puzzle) => run_puzzle(puzzle),
-            Action::Get(puzzle) => get_puzzle(puzzle, &config.cookie).map(|_| ()),
-            Action::Preview(puzzle) => preview_puzzle(puzzle),
-            Action::Print(puzzle) => print_puzzle(puzzle),
-            Action::Test(puzzle) => test_puzzle(puzzle),
+    fn new(year: i32, day: u32) -> anyhow::Result<Self> {
+        if year < FIRST_YEAR {
+            bail!("Advent of Code started in {FIRST_YEAR}, got year {year}");
         }
+        let days = Self::days_in_year(year);
+        if !(1..=days).contains(&day) {
+            bail!("{year} has puzzles for days 1-{days}, got day {day}");
+        }
+        Ok(Self { year, day })
     }
-}
 
-fn test_puzzle(_puzzle: &Puzzle) -> anyhow::Result<()> {
-    todo!("not yet implemented")
-}
+    /// Advent of Code has 25 puzzles per year through 2024 and 12 from 2025 onwards
+    fn days_in_year(year: i32) -> u32 {
+        if year >= 2025 { 12 } else { 25 }
+    }
 
-impl TryFrom<(i32, Option<u32>, Commands)> for Action {
-    type Error = anyhow::Error;
-
-    fn try_from(
-        (year, auto_day, command): (i32, Option<u32>, Commands),
-    ) -> Result<Self, Self::Error> {
-        let day = command
-            .day()
-            .or(auto_day)
-            .context("cannot infer day outside of december")?;
-        let action = match command {
-            Commands::Init { .. } => Action::Init(Puzzle { year, day }),
-            Commands::Test { .. } => Action::Test(Puzzle { year, day }),
-            Commands::Run { .. } => Action::Run(Puzzle { year, day }),
-            Commands::Get { .. } => Action::Get(Puzzle { year, day }),
-            Commands::Preview { .. } => Action::Preview(Puzzle { year, day }),
-            Commands::Print { .. } => Action::Print(Puzzle { year, day }),
-        };
-
-        Ok(action)
+    fn unlocks_at(&self) -> DateTime<FixedOffset> {
+        aoc_timezone()
+            .with_ymd_and_hms(self.year, 12, self.day, 0, 0, 0)
+            .single()
+            .expect("validated puzzle dates exist")
     }
 }
 
 fn main() -> anyhow::Result<()> {
-    // try to load env file, but we don't care if it fails
-    let _ = dotenvy::dotenv();
-
-    let config = envy::from_env::<Config>()?;
-
-    // Get the current local date and time
-    let local_date = Local::now();
-
-    // Extract the year, month, and day
-    let mut year = config.year;
-    let month = local_date.month(); // 1-12
-    let mut day = None;
-
-    // If 'tis the season we infer day and year if possible
-    if month == 12 && (1u32..=25).contains(&local_date.day()) {
-        year = year.or(Some(local_date.year()));
-        day = Some(local_date.day())
-    }
-
-    let year = year.context("cannot infer year outside of december, please set YEAR env var")?;
-
     let cli = Cli::parse();
-    let action = match cli.command {
-        Some(cmd) => Action::try_from((year, day, cmd)),
-        None => Action::try_from((year, day, Commands::Run { day })),
-    }?;
 
-    action.execute(&config)?;
+    let env_file = match dotenvy::dotenv() {
+        Ok(path) => Some(path),
+        Err(err) if err.not_found() => None,
+        Err(err) => return Err(err).context("failed to load .env file"),
+    };
+    let workspace = Workspace::discover(env_file)?;
 
-    Ok(())
+    let now = Utc::now().with_timezone(&aoc_timezone());
+    let in_season = now.month() == 12;
+
+    let year = match cli.year.or_else(|| workspace.year_from_cwd()) {
+        Some(year) => Some(year),
+        None => env_year()?,
+    }
+    .or(in_season.then(|| now.year()))
+    .context(
+        "cannot infer year outside of December: pass --year, run from a year directory or set YEAR",
+    )?;
+
+    let command = cli.command.unwrap_or(Commands::Run { day: None });
+
+    // Only infer the day when working on this December's event
+    let today = (in_season && year == now.year() && now.day() <= Puzzle::days_in_year(year))
+        .then(|| now.day());
+    let day = command
+        .day()
+        .or(today)
+        .context("cannot infer day outside of the current event, pass it explicitly")?;
+
+    let puzzle = Puzzle::new(year, day)?;
+
+    match command {
+        Commands::Init { .. } => init_puzzle(&workspace, &puzzle),
+        Commands::Test { .. } => bail!("`test` is not implemented yet"),
+        Commands::Run { .. } => run_puzzle(&workspace, &puzzle),
+        Commands::Get { .. } => {
+            get_puzzle(&workspace, &puzzle, &session_cookie()?)?;
+            preview_puzzle(&workspace, &puzzle)
+        }
+        Commands::Preview { .. } => preview_puzzle(&workspace, &puzzle),
+        Commands::Print { .. } => print_puzzle(&workspace, &puzzle),
+    }
 }
 
-fn init_puzzle(puzzle: &Puzzle) -> anyhow::Result<()> {
-    let (year, day) = (puzzle.year, puzzle.day);
+fn env_year() -> anyhow::Result<Option<i32>> {
+    match std::env::var("YEAR") {
+        Ok(year) => year
+            .trim()
+            .parse()
+            .map(Some)
+            .with_context(|| format!("YEAR must be a number, got {year:?}")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err).context("cannot read YEAR"),
+    }
+}
 
-    let solution_path = format!("{day}.ndc");
-    let solution_file = Path::new(&solution_path);
+/// Reads `COOKIE` from the environment, accepting both `session=<token>` and a bare token
+fn session_cookie() -> anyhow::Result<String> {
+    let raw = std::env::var("COOKIE").context(
+        "COOKIE is not set, add `COOKIE=session=<token>` to the .env file in your AoC root",
+    )?;
+    let raw = raw.trim();
 
-    if !solution_file.exists() {
-        let mut file =
-            std::fs::File::create(solution_file).context("cannot create solution file")?;
-        write!(file, "let input = read_file(\"input/{year}/{day}.txt\");\n\nfor line in input.lines() {{\n\tprint(line);\n}}").context("cannot write to file")?;
+    Ok(if raw.starts_with("session=") {
+        raw.to_owned()
+    } else {
+        format!("session={raw}")
+    })
+}
+
+fn init_puzzle(workspace: &Workspace, puzzle: &Puzzle) -> anyhow::Result<()> {
+    let path = workspace.solution_path(puzzle);
+    let dir = path.parent().expect("solution path has a year directory");
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+
+    match std::fs::File::create_new(&path) {
+        Ok(mut file) => {
+            file.write_all(SOLUTION_TEMPLATE.as_bytes())
+                .context("cannot write to solution file")?;
+            println!("Created {}", path.display());
+        }
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            println!("{} already exists", path.display());
+        }
+        Err(err) => return Err(err).context("cannot create solution file"),
     }
 
     Ok(())
 }
-fn run_puzzle(puzzle: &Puzzle) -> anyhow::Result<()> {
-    let day = puzzle.day;
-    let solution_path = format!("{day}.ndc");
-    let solution_file = Path::new(&solution_path);
 
-    if !solution_file.exists() {
-        return Err(anyhow!(
-            "{solution_file:?} not found, run init subcommand to create it"
-        ));
+fn run_puzzle(workspace: &Workspace, puzzle: &Puzzle) -> anyhow::Result<()> {
+    let solution = workspace.solution_path(puzzle);
+    if !solution.exists() {
+        bail!(
+            "{} not found, run `aoc init {} -y {}` to create it",
+            solution.display(),
+            puzzle.day,
+            puzzle.year
+        );
     }
 
-    let cmd = Command::new("ndc")
-        .arg(solution_file)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+    // Some solutions have their input hardcoded, so a missing input file isn't fatal
+    let input_path = workspace.input_path(puzzle);
+    let input = match std::fs::read(&input_path) {
+        Ok(input) => input,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {} not found (run `aoc get`), running with empty stdin",
+                input_path.display()
+            );
+            Vec::new()
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", input_path.display()));
+        }
+    };
+
+    let mut child = Command::new("ndc")
+        .arg(&solution)
+        .current_dir(solution.parent().unwrap_or(Path::new(".")))
+        .stdin(Stdio::piped())
         .spawn()
-        .context("failed to spawn child")?;
+        .context("failed to start ndc, is it installed and on your PATH?")?;
 
-    let stdout = cmd.stdout.context("cannot get stdout")?;
-    let mut stderr = cmd.stderr.context("cannot get stderr")?;
-
-    let mut out_buff = String::new();
-    let mut reader = BufReader::new(stdout);
-
-    loop {
-        let mut line_buffer = String::new();
-        match reader.read_line(&mut line_buffer) {
-            Ok(0) => break,
-            Err(err) => return Err(anyhow!("{err}")),
-            Ok(_) => {
-                print!("{line_buffer}");
-                std::io::stdout()
-                    .flush()
-                    .context("failed to flush stdout")?;
-                out_buff.push_str(&line_buffer);
-            }
+    // stdout/stderr are inherited, so output streams straight to the terminal and the child can't block on us.
+    // The stdin handle is dropped at the end of this block, which signals EOF.
+    {
+        let mut stdin = child.stdin.take().context("cannot open ndc stdin")?;
+        match stdin.write_all(&input) {
+            // The script exited (or doesn't read its input at all) before consuming everything
+            Err(err) if err.kind() == ErrorKind::BrokenPipe => {}
+            result => result.context("failed to pipe input to ndc")?,
         }
     }
 
-    let mut err_buff = String::new();
-    stderr
-        .read_to_string(&mut err_buff)
-        .context("failed to read stderr")?;
-
-    eprint!("{err_buff}");
-    std::io::stderr()
-        .flush()
-        .context("failed to flush stderr")?;
+    let status = child.wait().context("failed to wait for ndc")?;
+    if !status.success() {
+        bail!("ndc exited with {status}");
+    }
 
     Ok(())
 }
 
-fn print_puzzle(puzzle: &Puzzle) -> anyhow::Result<()> {
-    let input_file = puzzle.input_path();
-
-    if !std::fs::exists(&input_file).context("failed to check if file exists")? {
-        return Err(anyhow!("input file not downloaded"));
-    }
-
-    let file = std::fs::read_to_string(&input_file).context("failed to read input file")?;
-
-    println!("{file}");
-
-    Ok(())
+fn print_puzzle(workspace: &Workspace, puzzle: &Puzzle) -> anyhow::Result<()> {
+    print!("{}", workspace.read_input(puzzle)?);
+    std::io::stdout().flush().context("failed to flush stdout")
 }
 
-fn preview_puzzle(puzzle: &Puzzle) -> anyhow::Result<()> {
-    let input_file = puzzle.input_path();
+fn preview_puzzle(workspace: &Workspace, puzzle: &Puzzle) -> anyhow::Result<()> {
+    const HEAD: usize = 20;
+    const TAIL: usize = 20;
+    const TRUNCATE_ABOVE: usize = 50;
 
-    if !std::fs::exists(&input_file).context("failed to check if file exists")? {
-        return Err(anyhow!("input file not downloaded"));
+    let text = workspace.read_input(puzzle)?;
+    let lines: Vec<&str> = text.lines().collect();
+
+    if lines.is_empty() {
+        println!("Input is empty");
+        return Ok(());
     }
 
-    let file = std::fs::read_to_string(&input_file).context("failed to read input file")?;
+    // Wide enough for the largest line number and the ".." marker
+    let gutter = lines.len().to_string().len().max(2);
+    let term_width = terminal_size::terminal_size()
+        .map(|(width, _)| usize::from(width.0))
+        .unwrap_or(usize::MAX);
+    // Space left for line content after "<nr> | "
+    let max_content = term_width.saturating_sub(gutter + 3).max(10);
 
-    let line_count = file.lines().count();
-
-    let len = usize::try_from((line_count + 1).ilog10() + 2)
-        .context("failed to calc line number width")?;
-
-    let truncate = line_count > 50;
-
-    let max_w = term_size::dimensions().map(|(w, _)| w).unwrap_or(10_000);
-    let mut line_length_list = Vec::new();
-
-    for (nr, line) in file.lines().enumerate() {
-        line_length_list.push(line.len() as i32);
-        let line = if line.len() > max_w {
+    let print_line = |nr: usize, line: &str| {
+        let shown = if line.chars().count() > max_content {
             Cow::Owned(
                 line.chars()
-                    .take(max_w - len - 5)
+                    .take(max_content - 2)
                     .chain("..".chars())
                     .collect::<String>(),
             )
         } else {
             Cow::Borrowed(line)
         };
+        println!("{nr:>gutter$} | {shown}");
+    };
 
-        let nr = nr + 1;
-        if nr <= 20 || nr >= (line_count - 20) || !truncate {
-            println!("{:>width$} | {line}", nr, width = len)
-        } else if nr == 22 {
-            let truncated = line_count - 40;
-            println!(
-                "{:>width$} | <<{truncated} lines truncated>>",
-                "..",
-                width = len
-            );
-        } else if nr == 21 || nr == 23 {
-            println!("{:>width$} | ... ", "..", width = len);
+    if lines.len() > TRUNCATE_ABOVE {
+        let tail_start = lines.len() - TAIL;
+        for (idx, line) in lines[..HEAD].iter().enumerate() {
+            print_line(idx + 1, line);
+        }
+        let hidden = tail_start - HEAD;
+        println!("{:>gutter$} | ...", "..");
+        println!("{:>gutter$} | <<{hidden} lines truncated>>", "..");
+        println!("{:>gutter$} | ...", "..");
+        for (idx, line) in lines[tail_start..].iter().enumerate() {
+            print_line(tail_start + idx + 1, line);
+        }
+    } else {
+        for (idx, line) in lines.iter().enumerate() {
+            print_line(idx + 1, line);
         }
     }
 
-    line_length_list.sort();
-
-    if line_length_list.len() > 0 {
-        let median = if line_length_list.len() % 2 == 0 {
-            let idx = line_length_list.len().div_euclid(2);
-            f64::from(line_length_list[idx] + line_length_list[idx + 1]) / 2.0
-        } else {
-            let idx = line_length_list.len().div_ceil(2);
-            f64::from(line_length_list[idx])
-        };
-
-        println!("\nMax line length: {}", line_length_list.last().unwrap());
-        println!("Median line length: {median}");
-        println!("Min line length: {}", line_length_list.first().unwrap());
+    let mut lengths: Vec<usize> = lines.iter().map(|line| line.chars().count()).collect();
+    lengths.sort_unstable();
+    let n = lengths.len();
+    let median = if n.is_multiple_of(2) {
+        (lengths[n / 2 - 1] + lengths[n / 2]) as f64 / 2.0
     } else {
-        println!("\nInput is empty");
-    }
+        lengths[n / 2] as f64
+    };
+
+    println!("\nLines: {n}");
+    println!("Max line length: {}", lengths[n - 1]);
+    println!("Median line length: {median}");
+    println!("Min line length: {}", lengths[0]);
+
     Ok(())
 }
 
-fn get_puzzle(puzzle: &Puzzle, cookie_value: &str) -> anyhow::Result<()> {
-    let (year, day) = (puzzle.year, puzzle.day);
-
-    // TODO: write some logic to check if we can even download the puzzle (see if start time has passed)
-
-    let output_file = puzzle.input_path();
-
-    if !std::fs::exists(&output_file).context("failed to check if file exists")? {
-        std::fs::create_dir_all(format!("input/{year}/"))
-            .context("cannot create puzzle directory")?;
-
-        let response = ureq::get(&format!("https://adventofcode.com/{year}/day/{day}/input"))
-            .set("Cookie", cookie_value)
-            .set("User-Agent", "aoc-cli/0.0.1 fennis.tim@gmail.com")
-            .call()
-            .context("cannot create request")?;
-
-        let status = response.status();
-
-        if (200u16..300u16).contains(&status) {
-            let text = response
-                .into_string()
-                .context("cannot parse response as text")?;
-
-            std::fs::write(&output_file, text).context("cannot write puzzle output")?;
-        } else {
-            return Err(anyhow!("ERR: didn't receive 200 status from server"));
-        }
+fn get_puzzle(workspace: &Workspace, puzzle: &Puzzle, cookie: &str) -> anyhow::Result<()> {
+    let output_file = workspace.input_path(puzzle);
+    if output_file.exists() {
+        return Ok(());
     }
 
-    preview_puzzle(puzzle)
+    let unlocks_at = puzzle.unlocks_at();
+    let now = Utc::now();
+    if now < unlocks_at {
+        let wait = unlocks_at.signed_duration_since(now);
+        bail!(
+            "{} day {} unlocks at {} (in {}h{:02}m)",
+            puzzle.year,
+            puzzle.day,
+            unlocks_at.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+            wait.num_hours(),
+            wait.num_minutes() % 60
+        );
+    }
+
+    let url = format!(
+        "https://adventofcode.com/{}/day/{}/input",
+        puzzle.year, puzzle.day
+    );
+    let response = ureq::get(&url)
+        .header("Cookie", cookie)
+        .header("User-Agent", USER_AGENT)
+        .call();
+
+    let mut response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(400)) => {
+            bail!(
+                "server rejected the request (HTTP 400), the session cookie is probably missing or expired"
+            )
+        }
+        Err(ureq::Error::StatusCode(404)) => {
+            bail!("puzzle input not found (HTTP 404), is the puzzle unlocked yet?")
+        }
+        Err(ureq::Error::StatusCode(500)) => {
+            bail!(
+                "server error (HTTP 500), adventofcode.com also responds this way to an invalid session cookie"
+            )
+        }
+        Err(ureq::Error::StatusCode(code)) => bail!("server responded with HTTP {code}"),
+        Err(err) => return Err(anyhow!(err)).context("request to adventofcode.com failed"),
+    };
+
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .context("cannot read response body")?;
+
+    let dir = output_file
+        .parent()
+        .expect("input path has a year directory");
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    std::fs::write(&output_file, text)
+        .with_context(|| format!("cannot write {}", output_file.display()))?;
+
+    Ok(())
 }
